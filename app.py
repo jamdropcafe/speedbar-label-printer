@@ -11,7 +11,6 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Request, Response, HTTPException
-from fastapi.responses import JSONResponse
 from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 
@@ -27,18 +26,17 @@ MILK_MODIFIER_LIST_ID = os.getenv("MILK_MODIFIER_LIST_ID", "")
 
 PRINT_WIDTH = int(os.getenv("PRINT_WIDTH_DOTS", "256"))
 MIN_HEIGHT = int(os.getenv("MIN_LABEL_HEIGHT_DOTS", "195"))
-NAME_MAX_FONT = int(os.getenv("NAME_MAX_FONT_PX", "72"))
-CODE_MAX_FONT = int(os.getenv("CODE_MAX_FONT_PX", "64"))
-MIN_CODE_FONT = int(os.getenv("MIN_CODE_FONT_PX", "34"))
-LINE_GAP = int(os.getenv("LINE_GAP_DOTS", "0"))
+COMMON_MAX_FONT = int(os.getenv("COMMON_MAX_FONT_PX", "64"))
+COMMON_MIN_FONT = int(os.getenv("COMMON_MIN_FONT_PX", "30"))
+SEGMENT_GAP_DOTS = int(os.getenv("SEGMENT_GAP_DOTS", "4"))
+LINE_GAP_DOTS = int(os.getenv("LINE_GAP_DOTS", "0"))
 
 FONT_BLACK_PATH = os.getenv("FONT_BLACK", "")
 FONT_BOLD_PATH = os.getenv("FONT_BOLD", "")
 STAR_PRINTER_MAC = os.getenv("STAR_PRINTER_MAC", "").lower().replace("-", ":")
 
 DB = Path(__file__).with_name("speedbar.sqlite3")
-
-app = FastAPI(title="Speed Bar Square → Star Label Engine", version="0.1.0")
+app = FastAPI(title="Speed Bar Square → Star Label Engine", version="0.3.0")
 
 
 def db():
@@ -53,15 +51,13 @@ def init_db():
         CREATE TABLE IF NOT EXISTS processed_events(
             event_id TEXT PRIMARY KEY,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-        """)
+        )""")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS catalog_modifier_cache(
             modifier_id TEXT PRIMARY KEY,
             modifier_list_id TEXT,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-        """)
+        )""")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS print_jobs(
             id TEXT PRIMARY KEY,
@@ -73,8 +69,7 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             printed_at DATETIME,
             UNIQUE(order_id, line_uid, unit_index)
-        )
-        """)
+        )""")
 
 
 @app.on_event("startup")
@@ -111,18 +106,23 @@ async def square_get(path: str):
 
 def event_seen(event_id: str) -> bool:
     with db() as conn:
-        row = conn.execute("SELECT 1 FROM processed_events WHERE event_id=?", (event_id,)).fetchone()
-        return bool(row)
+        return bool(conn.execute(
+            "SELECT 1 FROM processed_events WHERE event_id=?", (event_id,)
+        ).fetchone())
 
 
 def mark_event(event_id: str):
     with db() as conn:
-        conn.execute("INSERT OR IGNORE INTO processed_events(event_id) VALUES (?)", (event_id,))
+        conn.execute(
+            "INSERT OR IGNORE INTO processed_events(event_id) VALUES (?)",
+            (event_id,)
+        )
 
 
 async def modifier_list_id(modifier_id: str) -> Optional[str]:
     if not modifier_id:
         return None
+
     with db() as conn:
         row = conn.execute(
             "SELECT modifier_list_id FROM catalog_modifier_cache WHERE modifier_id=?",
@@ -134,6 +134,7 @@ async def modifier_list_id(modifier_id: str) -> Optional[str]:
     data = await square_get(f"/v2/catalog/object/{modifier_id}")
     obj = data.get("object") or {}
     mlid = (obj.get("modifier_data") or {}).get("modifier_list_id")
+
     if mlid:
         with db() as conn:
             conn.execute(
@@ -144,19 +145,16 @@ async def modifier_list_id(modifier_id: str) -> Optional[str]:
 
 
 def customer_name(order: dict) -> str:
-    # Best source for POS "ticket name"
     if order.get("ticket_name"):
         return str(order["ticket_name"]).strip().upper()
 
-    # Fallback: fulfillment recipient
     for f in order.get("fulfillments") or []:
-        for details_key in ("pickup_details", "delivery_details", "shipment_details", "in_store_details"):
-            details = f.get(details_key) or {}
+        for key in ("pickup_details", "delivery_details", "shipment_details", "in_store_details"):
+            details = f.get(key) or {}
             recipient = details.get("recipient") or {}
             name = recipient.get("display_name")
             if name:
                 return str(name).strip().upper()
-
     return "ORDER"
 
 
@@ -174,99 +172,92 @@ def font(path: str, size: int):
     return ImageFont.load_default()
 
 
-def text_width(draw, text, fnt):
+def metrics(draw, text, fnt):
     if not text:
-        return 0
-    box = draw.textbbox((0, 0), text, font=fnt)
-    return box[2] - box[0]
+        return 0, 0
+    box = draw.textbbox((0, 0), text, font=fnt, anchor="lt")
+    return box[2] - box[0], box[3] - box[1]
 
 
-def fit_font(draw, text, path, max_px, min_px=20, width=PRINT_WIDTH):
-    size = max_px
-    while size > min_px:
-        f = font(path, size)
-        if text_width(draw, text, f) <= width:
-            return f, size
-        size -= 1
-    return font(path, min_px), min_px
+def fit_common_font(draw, line1: str, line2_segments: list, width: int):
+    # Same font size for both lines. We fit the larger requirement.
+    for size in range(COMMON_MAX_FONT, COMMON_MIN_FONT - 1, -1):
+        f_name = font(FONT_BLACK_PATH, size)
+        f_code = font(FONT_BOLD_PATH, size)
+        name_w, _ = metrics(draw, line1, f_name)
+        code_w = 0
+        for idx, seg in enumerate(line2_segments):
+            w, _ = metrics(draw, seg["text"], f_code)
+            code_w += w
+            if idx < len(line2_segments) - 1:
+                code_w += SEGMENT_GAP_DOTS
+        if name_w <= width and code_w <= width:
+            return f_name, f_code, size
+    return font(FONT_BLACK_PATH, COMMON_MIN_FONT), font(FONT_BOLD_PATH, COMMON_MIN_FONT), COMMON_MIN_FONT
 
 
-def layout_code_segments(segments, max_width, draw):
-    """
-    segments = list of {text:str, milk:bool}
-    Fit largest font that allows one line; if impossible at MIN_CODE_FONT,
-    wrap greedily without interpreting the modifier text.
-    """
-    joined = "".join(s["text"] for s in segments)
-
-    # Try largest possible single-line font first.
-    fnt, size = fit_font(draw, joined, FONT_BOLD_PATH, CODE_MAX_FONT, MIN_CODE_FONT, max_width)
-    if text_width(draw, joined, fnt) <= max_width:
-        return [[s.copy() for s in segments]], fnt, size
-
-    # Wrap at modifier segment boundaries at minimum allowed code font.
-    fnt = font(FONT_BOLD_PATH, MIN_CODE_FONT)
+def wrap_segments(draw, segments, code_font, width):
     lines = []
     current = []
     current_w = 0
-    for seg in segments:
-        w = text_width(draw, seg["text"], fnt)
-        if current and current_w + w > max_width:
+    for i, seg in enumerate(segments):
+        seg_w, _ = metrics(draw, seg["text"], code_font)
+        add_gap = SEGMENT_GAP_DOTS if current else 0
+        if current and current_w + add_gap + seg_w > width:
             lines.append(current)
-            current = []
-            current_w = 0
-        current.append(seg.copy())
-        current_w += w
+            current = [seg.copy()]
+            current_w = seg_w
+        else:
+            if current:
+                current_w += SEGMENT_GAP_DOTS
+            current.append(seg.copy())
+            current_w += seg_w
     if current:
         lines.append(current)
-    return lines, fnt, MIN_CODE_FONT
+    return lines
 
 
 def render_label(name: str, base_item_text: str, modifiers: list[dict]) -> bytes:
-    """
-    modifiers: [{"text": "...", "milk": True/False}]
-    No logical margins. Height expands only when required.
-    """
     scratch = Image.new("L", (PRINT_WIDTH, 1000), 255)
     d = ImageDraw.Draw(scratch)
 
-    name_font, _ = fit_font(d, name, FONT_BLACK_PATH, NAME_MAX_FONT, 30, PRINT_WIDTH)
-    name_bbox = d.textbbox((0, 0), name, font=name_font)
-    name_h = name_bbox[3] - name_bbox[1]
-
     segments = [{"text": base_item_text, "milk": False}] + modifiers
-    code_lines, code_font, _ = layout_code_segments(segments, PRINT_WIDTH, d)
+    name_font, code_font, _ = fit_common_font(d, name, segments, PRINT_WIDTH)
 
+    # If code still doesn't fit at the minimum common font, wrap it.
+    code_lines = wrap_segments(d, segments, code_font, PRINT_WIDTH)
+
+    _, name_h = metrics(d, name, name_font)
     line_heights = []
     for line in code_lines:
-        txt = "".join(s["text"] for s in line) or " "
-        box = d.textbbox((0, 0), txt, font=code_font)
-        line_heights.append(box[3] - box[1])
+        txt = " ".join(seg["text"] for seg in line) if line else " "
+        _, h = metrics(d, txt, code_font)
+        line_heights.append(h)
 
-    content_h = name_h + LINE_GAP + sum(line_heights)
+    content_h = name_h + LINE_GAP_DOTS + sum(line_heights)
     final_h = max(MIN_HEIGHT, content_h)
 
     img = Image.new("L", (PRINT_WIDTH, final_h), 255)
     draw = ImageDraw.Draw(img)
 
-    # Name: left-aligned, top at y=0.
-    draw.text((0, 0), name, fill=0, font=name_font)
-    y = name_h + LINE_GAP
+    draw.text((0, 0), name, fill=0, font=name_font, anchor="lt")
+    y = name_h + LINE_GAP_DOTS
 
-    for i, line in enumerate(code_lines):
+    for idx, line in enumerate(code_lines):
+        line_h = line_heights[idx]
         x = 0
-        for seg in line:
+        for sidx, seg in enumerate(line):
             txt = seg["text"]
-            w = text_width(draw, txt, code_font)
-            box = draw.textbbox((x, y), txt, font=code_font)
+            seg_w, _ = metrics(draw, txt, code_font)
             if seg.get("milk"):
-                # Black rectangle exactly behind milk modifier text.
-                draw.rectangle([x, y, x + w, y + line_heights[i]], fill=0)
-                draw.text((x, y), txt, fill=255, font=code_font)
+                draw.rectangle([x, y, x + seg_w - 1, y + line_h - 1], fill=0)
+                draw.text((x, y), txt, fill=255, font=code_font, anchor="lt")
             else:
-                draw.text((x, y), txt, fill=0, font=code_font)
-            x += w
-        y += line_heights[i]
+                draw.text((x, y), txt, fill=0, font=code_font, anchor="lt")
+            x += seg_w
+            if sidx < len(line) - 1:
+                x += SEGMENT_GAP_DOTS
+        y += line_h
 
     out = io.BytesIO()
     img.save(out, format="PNG", optimize=True)
@@ -282,10 +273,6 @@ async def make_jobs_from_order(order: dict):
     for item in order.get("line_items") or []:
         line_uid = item.get("uid") or str(uuid.uuid4())
         qty = int(float(item.get("quantity", "1")))
-        # IMPORTANT:
-        # This uses the item's kitchen/display name exactly as Square returns it.
-        # If your catalog already encodes e.g. "LC" for Large Caramel Cappuccino,
-        # it will print "LC". Otherwise later we can choose kitchen_name/code source.
         base = (item.get("name") or "").strip()
 
         mods = []
@@ -326,14 +313,12 @@ async def square_webhook(request: Request):
     if not event_id:
         return {"ok": True}
 
-    # Square can retry webhooks; never print twice.
     if event_seen(event_id):
         return {"ok": True, "duplicate": True}
 
     typ = payload.get("type")
     payment = (((payload.get("data") or {}).get("object") or {}).get("payment") or {})
 
-    # Only act once a payment is actually completed.
     if typ in ("payment.created", "payment.updated") and payment.get("status") == "COMPLETED":
         if LOCATION_ID and payment.get("location_id") != LOCATION_ID:
             mark_event(event_id)
@@ -367,7 +352,7 @@ def next_job():
         ).fetchone()
 
 
-@app.api_route("/cloudprnt", methods=["POST"])
+@app.post("/cloudprnt")
 async def cloudprnt_poll(request: Request):
     if not printer_allowed(request):
         raise HTTPException(status_code=401, detail="Unknown printer")
@@ -376,16 +361,15 @@ async def cloudprnt_poll(request: Request):
     if not job:
         return {"jobReady": False}
 
-    token = job["id"]
     return {
         "jobReady": True,
         "mediaTypes": ["image/png"],
-        "jobToken": token,
+        "jobToken": job["id"],
         "deleteMethod": "DELETE"
     }
 
 
-@app.api_route("/cloudprnt", methods=["GET"])
+@app.get("/cloudprnt")
 async def cloudprnt_get(request: Request):
     if not printer_allowed(request):
         raise HTTPException(status_code=401, detail="Unknown printer")
@@ -396,8 +380,6 @@ async def cloudprnt_get(request: Request):
         or request.query_params.get("jobToken")
     )
     if not token:
-        # CloudPRNT server-info request can hit a derived URL; keep this endpoint
-        # focused on print jobs.
         raise HTTPException(status_code=404, detail="No job token")
 
     with db() as conn:
@@ -407,11 +389,12 @@ async def cloudprnt_get(request: Request):
         ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Job not found")
+
         conn.execute("UPDATE print_jobs SET state='SENT' WHERE id=?", (token,))
         return Response(content=row["png"], media_type="image/png")
 
 
-@app.api_route("/cloudprnt", methods=["DELETE"])
+@app.delete("/cloudprnt")
 async def cloudprnt_delete(request: Request):
     if not printer_allowed(request):
         raise HTTPException(status_code=401, detail="Unknown printer")
@@ -421,6 +404,7 @@ async def cloudprnt_delete(request: Request):
         or request.query_params.get("token")
         or request.query_params.get("jobToken")
     )
+
     if token:
         with db() as conn:
             conn.execute(
@@ -433,16 +417,30 @@ async def cloudprnt_delete(request: Request):
 @app.get("/health")
 def health():
     with db() as conn:
-        ready = conn.execute("SELECT COUNT(*) c FROM print_jobs WHERE state='READY'").fetchone()["c"]
-    return {"ok": True, "ready_jobs": ready, "width_dots": PRINT_WIDTH, "min_height_dots": MIN_HEIGHT}
+        ready = conn.execute(
+            "SELECT COUNT(*) c FROM print_jobs WHERE state='READY'"
+        ).fetchone()["c"]
+
+    return {
+        "ok": True,
+        "ready_jobs": ready,
+        "width_dots": PRINT_WIDTH,
+        "min_height_dots": MIN_HEIGHT,
+        "version": "0.3.0"
+    }
 
 
 @app.get("/preview")
-def preview(name: str = "JAMIE", code: str = "LCAC2eq", milk_start: int = 2, milk_len: int = 1):
-    # Standalone visual test without Square.
+def preview(
+    name: str = "JAMIE",
+    code: str = "LCAC2eq",
+    milk_start: int = 2,
+    milk_len: int = 1
+):
     before = code[:milk_start]
-    milk = code[milk_start:milk_start+milk_len]
-    after = code[milk_start+milk_len:]
+    milk = code[milk_start:milk_start + milk_len]
+    after = code[milk_start + milk_len:]
+
     png = render_label(
         name=name,
         base_item_text=before,
