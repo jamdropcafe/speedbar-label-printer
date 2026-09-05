@@ -37,7 +37,7 @@ FONT_BOLD_PATH = os.getenv("FONT_BOLD", "")
 STAR_PRINTER_MAC = os.getenv("STAR_PRINTER_MAC", "").lower().replace("-", ":")
 
 DB = Path(__file__).with_name("speedbar.sqlite3")
-app = FastAPI(title="Speed Bar Square → Star Label Engine", version="0.4.0")
+app = FastAPI(title="Speed Bar Square → Star Label Engine", version="0.6.0")
 
 
 def db():
@@ -180,23 +180,36 @@ def metrics(draw, text, fnt):
     return box[2] - box[0], box[3] - box[1]
 
 
-def fit_common_font(draw, line1: str, line2_segments: list, width: int):
-    # Same base size for both lines; milk is slightly larger.
+def segment_width(draw, seg, code_font, milk_font):
+    use_font = milk_font if seg.get("milk") else code_font
+    w, _ = metrics(draw, seg["text"], use_font)
+    return w
+
+
+def choose_primary_fonts(draw, name: str, segments: list, width: int):
+    """
+    Lines 1 and 2 share the same base font size.
+    We choose the largest size that fits the customer name and at least the
+    first code segment on line 2. We do NOT shrink line 2 merely to force all
+    modifiers onto it; overflow goes to line 3 instead.
+    """
     for size in range(COMMON_MAX_FONT, COMMON_MIN_FONT - 1, -1):
         f_name = font(FONT_BLACK_PATH, size)
         f_code = font(FONT_BOLD_PATH, size)
         milk_size = max(size, int(round(size * MILK_FONT_SCALE)))
         f_milk = font(FONT_BOLD_PATH, milk_size)
-        name_w, _ = metrics(draw, line1, f_name)
-        code_w = 0
-        for idx, seg in enumerate(line2_segments):
-            use_font = f_milk if seg.get("milk") else f_code
-            w, _ = metrics(draw, seg["text"], use_font)
-            code_w += w
-            if idx < len(line2_segments) - 1:
-                code_w += SEGMENT_GAP_DOTS
-        if name_w <= width and code_w <= width:
-            return f_name, f_code, f_milk, size
+
+        name_w, _ = metrics(draw, name, f_name)
+        if name_w > width:
+            continue
+
+        if segments:
+            first_w = segment_width(draw, segments[0], f_code, f_milk)
+            if first_w > width:
+                continue
+
+        return f_name, f_code, f_milk, size
+
     base = COMMON_MIN_FONT
     return (
         font(FONT_BLACK_PATH, base),
@@ -205,73 +218,127 @@ def fit_common_font(draw, line1: str, line2_segments: list, width: int):
         base,
     )
 
-def wrap_segments(draw, segments, code_font, milk_font, width):
-    lines = []
-    current = []
-    current_w = 0
+
+def split_primary_and_overflow(draw, segments, code_font, milk_font, width):
+    """Pack as many complete modifier blocks as possible onto line 2."""
+    line2, line3 = [], []
+    used = 0
+
     for seg in segments:
-        use_font = milk_font if seg.get("milk") else code_font
-        seg_w, _ = metrics(draw, seg["text"], use_font)
-        add_gap = SEGMENT_GAP_DOTS if current else 0
-        if current and current_w + add_gap + seg_w > width:
-            lines.append(current)
-            current = [seg.copy()]
-            current_w = seg_w
+        seg_w = segment_width(draw, seg, code_font, milk_font)
+        gap = SEGMENT_GAP_DOTS if line2 else 0
+        if not line3 and (not line2 or used + gap + seg_w <= width):
+            if line2:
+                used += SEGMENT_GAP_DOTS
+            line2.append(seg.copy())
+            used += seg_w
         else:
-            if current:
-                current_w += SEGMENT_GAP_DOTS
-            current.append(seg.copy())
-            current_w += seg_w
-    if current:
-        lines.append(current)
-    return lines
+            line3.append(seg.copy())
+
+    return line2, line3
+
+
+def choose_overflow_fonts(draw, segments, width):
+    """Line 3 gets its own largest possible font, independent of line 2."""
+    if not segments:
+        return None, None, None
+
+    for size in range(COMMON_MAX_FONT, COMMON_MIN_FONT - 1, -1):
+        f_code = font(FONT_BOLD_PATH, size)
+        f_milk = font(FONT_BOLD_PATH, max(size, int(round(size * MILK_FONT_SCALE))))
+        total = 0
+        for idx, seg in enumerate(segments):
+            total += segment_width(draw, seg, f_code, f_milk)
+            if idx < len(segments) - 1:
+                total += SEGMENT_GAP_DOTS
+        if total <= width:
+            return f_code, f_milk, size
+
+    # Absolute fallback: keep line 2 unchanged and shrink only line 3.
+    for size in range(COMMON_MIN_FONT - 1, 11, -1):
+        f_code = font(FONT_BOLD_PATH, size)
+        f_milk = font(FONT_BOLD_PATH, max(size, int(round(size * MILK_FONT_SCALE))))
+        total = 0
+        for idx, seg in enumerate(segments):
+            total += segment_width(draw, seg, f_code, f_milk)
+            if idx < len(segments) - 1:
+                total += SEGMENT_GAP_DOTS
+        if total <= width:
+            return f_code, f_milk, size
+
+    return font(FONT_BOLD_PATH, 12), font(FONT_BOLD_PATH, max(12, int(round(12 * MILK_FONT_SCALE)))), 12
+
+
+def line_font_metrics(line, code_font, milk_font):
+    ascents, descents = [], []
+    for seg in line:
+        use_font = milk_font if seg.get("milk") else code_font
+        try:
+            ascent, descent = use_font.getmetrics()
+        except AttributeError:
+            ascent, descent = use_font.size, 0
+        ascents.append(ascent)
+        descents.append(descent)
+    max_ascent = max(ascents) if ascents else code_font.size
+    max_descent = max(descents) if descents else 0
+    return max_ascent, max_descent, max_ascent + max_descent
+
+
+def draw_code_line(draw, line, y, code_font, milk_font):
+    max_ascent, max_descent, line_h = line_font_metrics(line, code_font, milk_font)
+    baseline_y = y + max_ascent
+    x = 0
+    for idx, seg in enumerate(line):
+        txt = seg["text"]
+        use_font = milk_font if seg.get("milk") else code_font
+        seg_w, _ = metrics(draw, txt, use_font)
+        if seg.get("milk"):
+            draw.rectangle([x, y, x + seg_w - 1, y + line_h - 1], fill=0)
+            draw.text((x, baseline_y), txt, fill=255, font=use_font, anchor="ls")
+        else:
+            draw.text((x, baseline_y), txt, fill=0, font=use_font, anchor="ls")
+        x += seg_w
+        if idx < len(line) - 1:
+            x += SEGMENT_GAP_DOTS
+    return line_h
+
 
 def render_label(name: str, base_item_text: str, modifiers: list[dict]) -> bytes:
     scratch = Image.new("L", (PRINT_WIDTH, 1000), 255)
     d = ImageDraw.Draw(scratch)
 
     segments = [{"text": base_item_text, "milk": False}] + modifiers
-    name_font, code_font, milk_font, _ = fit_common_font(d, name, segments, PRINT_WIDTH)
 
-    # If code still doesn't fit at the minimum common font, wrap it.
-    code_lines = wrap_segments(d, segments, code_font, milk_font, PRINT_WIDTH)
+    # Lines 1 + 2: biggest shared font. Line 2 is never reduced simply to
+    # avoid overflow; extra modifier blocks are sent to line 3.
+    name_font, code_font, milk_font, _ = choose_primary_fonts(d, name, segments, PRINT_WIDTH)
+    line2, overflow = split_primary_and_overflow(d, segments, code_font, milk_font, PRINT_WIDTH)
+
+    # Line 3: independent maximum font, only when required.
+    overflow_font = overflow_milk_font = None
+    if overflow:
+        overflow_font, overflow_milk_font, _ = choose_overflow_fonts(d, overflow, PRINT_WIDTH)
 
     _, name_h = metrics(d, name, name_font)
-    line_heights = []
-    for line in code_lines:
-        hs = []
-        for seg in line:
-            use_font = milk_font if seg.get("milk") else code_font
-            _, h = metrics(d, seg["text"] or " ", use_font)
-            hs.append(h)
-        line_heights.append(max(hs) if hs else metrics(d, " ", code_font)[1])
+    line2_h = line_font_metrics(line2, code_font, milk_font)[2] if line2 else 0
+    line3_h = line_font_metrics(overflow, overflow_font, overflow_milk_font)[2] if overflow else 0
 
-    content_h = name_h + LINE_GAP_DOTS + sum(line_heights)
+    content_h = name_h + LINE_GAP_DOTS + line2_h
+    if overflow:
+        content_h += line3_h
+
     final_h = max(MIN_HEIGHT, content_h)
-
     img = Image.new("L", (PRINT_WIDTH, final_h), 255)
     draw = ImageDraw.Draw(img)
 
     draw.text((0, 0), name, fill=0, font=name_font, anchor="lt")
     y = name_h + LINE_GAP_DOTS
 
-    for idx, line in enumerate(code_lines):
-        line_h = line_heights[idx]
-        x = 0
-        for sidx, seg in enumerate(line):
-            txt = seg["text"]
-            use_font = milk_font if seg.get("milk") else code_font
-            seg_w, seg_h = metrics(draw, txt, use_font)
-            text_y = y + max(0, (line_h - seg_h) // 2)
-            if seg.get("milk"):
-                draw.rectangle([x, y, x + seg_w - 1, y + line_h - 1], fill=0)
-                draw.text((x, text_y), txt, fill=255, font=use_font, anchor="lt")
-            else:
-                draw.text((x, text_y), txt, fill=0, font=use_font, anchor="lt")
-            x += seg_w
-            if sidx < len(line) - 1:
-                x += SEGMENT_GAP_DOTS
-        y += line_h
+    if line2:
+        y += draw_code_line(draw, line2, y, code_font, milk_font)
+
+    if overflow:
+        draw_code_line(draw, overflow, y, overflow_font, overflow_milk_font)
 
     out = io.BytesIO()
     img.save(out, format="PNG", optimize=True)
@@ -440,7 +507,7 @@ def health():
         "ready_jobs": ready,
         "width_dots": PRINT_WIDTH,
         "min_height_dots": MIN_HEIGHT,
-        "version": "0.4.0"
+        "version": "0.6.0"
     }
 
 
