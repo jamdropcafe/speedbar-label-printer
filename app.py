@@ -22,21 +22,22 @@ ACCESS_TOKEN = os.getenv("SQUARE_ACCESS_TOKEN", "")
 WEBHOOK_SIGNATURE_KEY = os.getenv("SQUARE_WEBHOOK_SIGNATURE_KEY", "")
 WEBHOOK_URL = os.getenv("SQUARE_WEBHOOK_URL", "")
 LOCATION_ID = os.getenv("SQUARE_LOCATION_ID", "")
-MILK_MODIFIER_LIST_ID = os.getenv("MILK_MODIFIER_LIST_ID", "")
+MILK_MODIFIER_LIST_IDS = {x.strip() for x in os.getenv("MILK_MODIFIER_LIST_IDS", "").split(",") if x.strip()}
 
 PRINT_WIDTH = int(os.getenv("PRINT_WIDTH_DOTS", "256"))
 MIN_HEIGHT = int(os.getenv("MIN_LABEL_HEIGHT_DOTS", "195"))
 COMMON_MAX_FONT = int(os.getenv("COMMON_MAX_FONT_PX", "64"))
 COMMON_MIN_FONT = int(os.getenv("COMMON_MIN_FONT_PX", "30"))
 SEGMENT_GAP_DOTS = int(os.getenv("SEGMENT_GAP_DOTS", "4"))
-LINE_GAP_DOTS = int(os.getenv("LINE_GAP_DOTS", "0"))
+LINE_GAP_DOTS = int(os.getenv("LINE_GAP_DOTS", "6"))
+MILK_FONT_SCALE = float(os.getenv("MILK_FONT_SCALE", "1.12"))
 
 FONT_BLACK_PATH = os.getenv("FONT_BLACK", "")
 FONT_BOLD_PATH = os.getenv("FONT_BOLD", "")
 STAR_PRINTER_MAC = os.getenv("STAR_PRINTER_MAC", "").lower().replace("-", ":")
 
 DB = Path(__file__).with_name("speedbar.sqlite3")
-app = FastAPI(title="Speed Bar Square → Star Label Engine", version="0.3.0")
+app = FastAPI(title="Speed Bar Square → Star Label Engine", version="0.4.0")
 
 
 def db():
@@ -180,28 +181,37 @@ def metrics(draw, text, fnt):
 
 
 def fit_common_font(draw, line1: str, line2_segments: list, width: int):
-    # Same font size for both lines. We fit the larger requirement.
+    # Same base size for both lines; milk is slightly larger.
     for size in range(COMMON_MAX_FONT, COMMON_MIN_FONT - 1, -1):
         f_name = font(FONT_BLACK_PATH, size)
         f_code = font(FONT_BOLD_PATH, size)
+        milk_size = max(size, int(round(size * MILK_FONT_SCALE)))
+        f_milk = font(FONT_BOLD_PATH, milk_size)
         name_w, _ = metrics(draw, line1, f_name)
         code_w = 0
         for idx, seg in enumerate(line2_segments):
-            w, _ = metrics(draw, seg["text"], f_code)
+            use_font = f_milk if seg.get("milk") else f_code
+            w, _ = metrics(draw, seg["text"], use_font)
             code_w += w
             if idx < len(line2_segments) - 1:
                 code_w += SEGMENT_GAP_DOTS
         if name_w <= width and code_w <= width:
-            return f_name, f_code, size
-    return font(FONT_BLACK_PATH, COMMON_MIN_FONT), font(FONT_BOLD_PATH, COMMON_MIN_FONT), COMMON_MIN_FONT
+            return f_name, f_code, f_milk, size
+    base = COMMON_MIN_FONT
+    return (
+        font(FONT_BLACK_PATH, base),
+        font(FONT_BOLD_PATH, base),
+        font(FONT_BOLD_PATH, max(base, int(round(base * MILK_FONT_SCALE)))),
+        base,
+    )
 
-
-def wrap_segments(draw, segments, code_font, width):
+def wrap_segments(draw, segments, code_font, milk_font, width):
     lines = []
     current = []
     current_w = 0
-    for i, seg in enumerate(segments):
-        seg_w, _ = metrics(draw, seg["text"], code_font)
+    for seg in segments:
+        use_font = milk_font if seg.get("milk") else code_font
+        seg_w, _ = metrics(draw, seg["text"], use_font)
         add_gap = SEGMENT_GAP_DOTS if current else 0
         if current and current_w + add_gap + seg_w > width:
             lines.append(current)
@@ -216,23 +226,25 @@ def wrap_segments(draw, segments, code_font, width):
         lines.append(current)
     return lines
 
-
 def render_label(name: str, base_item_text: str, modifiers: list[dict]) -> bytes:
     scratch = Image.new("L", (PRINT_WIDTH, 1000), 255)
     d = ImageDraw.Draw(scratch)
 
     segments = [{"text": base_item_text, "milk": False}] + modifiers
-    name_font, code_font, _ = fit_common_font(d, name, segments, PRINT_WIDTH)
+    name_font, code_font, milk_font, _ = fit_common_font(d, name, segments, PRINT_WIDTH)
 
     # If code still doesn't fit at the minimum common font, wrap it.
-    code_lines = wrap_segments(d, segments, code_font, PRINT_WIDTH)
+    code_lines = wrap_segments(d, segments, code_font, milk_font, PRINT_WIDTH)
 
     _, name_h = metrics(d, name, name_font)
     line_heights = []
     for line in code_lines:
-        txt = " ".join(seg["text"] for seg in line) if line else " "
-        _, h = metrics(d, txt, code_font)
-        line_heights.append(h)
+        hs = []
+        for seg in line:
+            use_font = milk_font if seg.get("milk") else code_font
+            _, h = metrics(d, seg["text"] or " ", use_font)
+            hs.append(h)
+        line_heights.append(max(hs) if hs else metrics(d, " ", code_font)[1])
 
     content_h = name_h + LINE_GAP_DOTS + sum(line_heights)
     final_h = max(MIN_HEIGHT, content_h)
@@ -248,12 +260,14 @@ def render_label(name: str, base_item_text: str, modifiers: list[dict]) -> bytes
         x = 0
         for sidx, seg in enumerate(line):
             txt = seg["text"]
-            seg_w, _ = metrics(draw, txt, code_font)
+            use_font = milk_font if seg.get("milk") else code_font
+            seg_w, seg_h = metrics(draw, txt, use_font)
+            text_y = y + max(0, (line_h - seg_h) // 2)
             if seg.get("milk"):
                 draw.rectangle([x, y, x + seg_w - 1, y + line_h - 1], fill=0)
-                draw.text((x, y), txt, fill=255, font=code_font, anchor="lt")
+                draw.text((x, text_y), txt, fill=255, font=use_font, anchor="lt")
             else:
-                draw.text((x, y), txt, fill=0, font=code_font, anchor="lt")
+                draw.text((x, text_y), txt, fill=0, font=use_font, anchor="lt")
             x += seg_w
             if sidx < len(line) - 1:
                 x += SEGMENT_GAP_DOTS
@@ -282,9 +296,9 @@ async def make_jobs_from_order(order: dict):
                 continue
             is_milk = False
             modifier_id = m.get("catalog_object_id")
-            if MILK_MODIFIER_LIST_ID and modifier_id:
+            if MILK_MODIFIER_LIST_IDS and modifier_id:
                 mlid = await modifier_list_id(modifier_id)
-                is_milk = (mlid == MILK_MODIFIER_LIST_ID)
+                is_milk = (mlid in MILK_MODIFIER_LIST_IDS)
             mods.append({"text": text, "milk": is_milk})
 
         png = render_label(name, base, mods)
@@ -426,7 +440,7 @@ def health():
         "ready_jobs": ready,
         "width_dots": PRINT_WIDTH,
         "min_height_dots": MIN_HEIGHT,
-        "version": "0.3.0"
+        "version": "0.4.0"
     }
 
 
